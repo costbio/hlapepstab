@@ -63,9 +63,9 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
-    python batch_mhcfine.py --csv input_file.csv --protein-sequence "MRVTAPRTVLLLLSGALALTETWAGSHSMRYFYTAMSRPGRGEPRFIAVGYVDDTQFVRFDSDAASPRMAPRAPWIEQEGPEYWDRETQISKTNTQTYRESLRNLRGYYNQSEAGSHTLQRMYGCDVGPDGRLLRGHDQSAYDGKDYIALNEDLSSWTAADTAAQITQRKWEAAREAEQW" --max-peptides 10
+    python batch_mhcfine.py --csv input_file.csv --max-peptides 10
 
-CSV file must contain columns: 'Peptide_sequence' and 'Protein_sequence'
+CSV file must contain columns: 'Peptide_sequence', 'Protein_sequence', and 'Subtype'
         """
     )
     
@@ -73,13 +73,7 @@ CSV file must contain columns: 'Peptide_sequence' and 'Protein_sequence'
         '--csv', 
         type=str, 
         required=True,
-        help='Path to CSV file containing peptide and protein sequences'
-    )
-    
-    parser.add_argument(
-        '--protein-sequence',
-        type=str,
-        help='Protein sequence to use for all peptides (overrides CSV Protein_sequence column if provided)'
+        help='Path to CSV file containing peptide sequences, protein sequences, and subtypes'
     )
     
     parser.add_argument(
@@ -108,10 +102,38 @@ def main():
     logger.info("Starting MHC-fine batch prediction")
     logger.info(f"Input CSV file: {args.csv}")
     
+    import pandas as pd
+    import sys
+    
     # Check if CSV file exists
     if not os.path.exists(args.csv):
         logger.error(f"CSV file not found: {args.csv}")
         sys.exit(1)
+
+    # Read and validate CSV file early
+    logger.info(f"Reading CSV file: {args.csv}")
+    try:
+        df = pd.read_csv(args.csv, header=0, delimiter=args.delimiter)
+        logger.info(f"CSV file loaded successfully. Shape: {df.shape}")
+    except Exception as e:
+        logger.error(f"Error reading CSV file: {e}")
+        sys.exit(1)
+
+    # Validate required columns
+    required_columns = ['Peptide_sequence', 'Protein_sequence', 'Subtype']
+    
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        logger.error(f"Missing required columns in CSV: {missing_columns}")
+        logger.error(f"Available columns: {list(df.columns)}")
+        logger.error("CSV file must contain: 'Peptide_sequence', 'Protein_sequence', and 'Subtype' columns")
+        sys.exit(1)
+
+    logger.info(f"CSV file validation passed. Available columns: {list(df.columns)}")
+    
+    # Get unique subtypes for logging
+    unique_subtypes = df['Subtype'].unique()
+    logger.info(f"Found {len(unique_subtypes)} unique subtypes: {list(unique_subtypes)}")
 
     # Clone mhc-fine repository if it doesn't exist
     if not os.path.exists('mhc-fine'):
@@ -153,39 +175,100 @@ def main():
     logger.info("Setting up MSA generation permissions...")
     subprocess.run(["chmod", "+x", "a3m_generation/msa_run"], check=True)
 
-    # Read CSV file
-    logger.info(f"Reading CSV file: {args.csv}")
-    try:
-        df = pd.read_csv(f"../{args.csv}", header=0, delimiter=args.delimiter)
-        logger.info(f"CSV file loaded successfully. Shape: {df.shape}")
-    except Exception as e:
-        logger.error(f"Error reading CSV file: {e}")
-        sys.exit(1)
-
-    # Validate required columns
-    required_columns = ['Peptide_sequence']
-    if not args.protein_sequence:
-        required_columns.append('Protein_sequence')
-    
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        logger.error(f"Missing required columns in CSV: {missing_columns}")
-        logger.error(f"Available columns: {list(df.columns)}")
-        sys.exit(1)
-
-    logger.info(f"CSV file validation passed. Available columns: {list(df.columns)}")
     logger.info(f"Sample of data:\n{df.head()}")
+
+    # Limit number of peptides if specified
+    if args.max_peptides:
+        df = df.head(args.max_peptides)
+        logger.info(f"Processing limited to {args.max_peptides} peptides")
+    
+    logger.info(f"Total peptides to process: {len(df)}")
+
+    # Process each peptide
+    for i, (_, row) in enumerate(df.iterrows(), 1):
+        peptide_sequence = row['Peptide_sequence']
+        protein_sequence = row['Protein_sequence']
+        subtype = row['Subtype']
+        
+        logger.info(f"Processing peptide {i}/{len(df)}: {peptide_sequence} (Subtype: {subtype})")
+        
+        # Create unique ID with subtype and peptide sequence
+        unique_id = f"{subtype}_{peptide_sequence}"
+        
+        a3m_path = f"a3m_generation/{unique_id}.a3m"
+        
+        try:
+            logger.info(f"Generating MSA for {unique_id}...")
+            preprocess.get_a3m(protein_sequence, a3m_path, unique_id)
+            
+            logger.info(f"Preprocessing for inference...")
+            np_sample = preprocess.preprocess_for_inference(protein_sequence, peptide_sequence, a3m_path)
+            
+            my_model = model.Model()
+            
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+                free_mem, total_mem = torch.cuda.mem_get_info(0)
+                logger.info(f"GPU Memory - Free: {free_mem / (1024 ** 2):.2f} MiB, Total: {total_mem / (1024 ** 2):.2f} MiB")
+                
+                logger.info(f"Running inference on {device}...")
+                my_model.inference(np_sample, unique_id)
+                logger.info(f"Inference completed successfully for {unique_id}")
+                
+        except Exception as e:
+            logger.error(f"Error occurred during processing for {unique_id}: {e}")
+            continue
+
+    logger.info("Batch processing completed")
+
+    # Get unique subtypes for logging
+    unique_subtypes = df['Subtype'].unique()
+    logger.info(f"Found {len(unique_subtypes)} unique subtypes: {list(unique_subtypes)}")
 
     peptide_list = df['Peptide_sequence'].tolist()
     
     # Limit number of peptides if specified
     if args.max_peptides:
+        df = df.head(args.max_peptides)
         peptide_list = peptide_list[:args.max_peptides]
         logger.info(f"Processing limited to {args.max_peptides} peptides")
     
     logger.info(f"Total peptides to process: {len(peptide_list)}")
-    
-    # Initialize progress tracking
+
+    # Process each peptide
+    for i, (_, row) in enumerate(df.iterrows(), 1):
+        peptide_sequence = row['Peptide_sequence']
+        protein_sequence = row['Protein_sequence']
+        subtype = row['Subtype']
+        
+        logger.info(f"Processing peptide {i}/{len(df)}: {peptide_sequence} (Subtype: {subtype})")
+        
+        # Create unique ID with subtype and peptide sequence
+        unique_id = f"{subtype}_{peptide_sequence}"
+        
+        a3m_path = f"a3m_generation/{unique_id}.a3m"
+        
+        try:
+            logger.info(f"Generating MSA for {unique_id}...")
+            preprocess.get_a3m(protein_sequence, a3m_path, unique_id)
+            
+            logger.info(f"Preprocessing for inference...")
+            np_sample = preprocess.preprocess_for_inference(protein_sequence, peptide_sequence, a3m_path)
+            
+            my_model = model.Model()
+            
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+                free_mem, total_mem = torch.cuda.mem_get_info(0)
+                logger.info(f"GPU Memory - Free: {free_mem / (1024 ** 2):.2f} MiB, Total: {total_mem / (1024 ** 2):.2f} MiB")
+                
+                logger.info(f"Running inference on {device}...")
+                my_model.inference(np_sample, unique_id)
+                logger.info(f"Inference completed successfully for {unique_id}")
+                
+        except Exception as e:
+            logger.error(f"Error occurred during processing for {unique_id}: {e}")
+            continue    # Initialize progress tracking
     start_time = time.time()
     successful_predictions = 0
     failed_predictions = 0
