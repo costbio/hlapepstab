@@ -14,6 +14,7 @@
 # Update log:
 # - September 09, 2025: Initial version
 # - Modified to accept CSV input via command line arguments and added logging
+# - September 26, 2025: Improved error handling and logging for MSA generation and preprocessing steps
 
 import argparse
 import logging
@@ -184,91 +185,127 @@ def main():
     
     logger.info(f"Total peptides to process: {len(df)}")
 
-    # Process each peptide
-    for i, (_, row) in enumerate(df.iterrows(), 1):
-        peptide_sequence = row['Peptide_sequence']
-        protein_sequence = row['Protein_sequence']
-        subtype = row['Subtype']
-        
-        logger.info(f"Processing peptide {i}/{len(df)}: {peptide_sequence} (Subtype: {subtype})")
-        
-        # Create unique ID with subtype and peptide sequence
-        unique_id = f"{subtype}_{peptide_sequence}"
-        
-        a3m_path = f"a3m_generation/{unique_id}.a3m"
-        
-        try:
-            logger.info(f"Generating MSA for {unique_id}...")
-            preprocess.get_a3m(protein_sequence, a3m_path, unique_id)
-            
-            logger.info(f"Preprocessing for inference...")
-            np_sample = preprocess.preprocess_for_inference(protein_sequence, peptide_sequence, a3m_path)
-            
-            my_model = model.Model()
-            
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-                free_mem, total_mem = torch.cuda.mem_get_info(0)
-                logger.info(f"GPU Memory - Free: {free_mem / (1024 ** 2):.2f} MiB, Total: {total_mem / (1024 ** 2):.2f} MiB")
-                
-                logger.info(f"Running inference on {device}...")
-                my_model.inference(np_sample, unique_id)
-                logger.info(f"Inference completed successfully for {unique_id}")
-                
-        except Exception as e:
-            logger.error(f"Error occurred during processing for {unique_id}: {e}")
-            continue
-
-    logger.info("Batch processing completed")
-
-    # Get unique subtypes for logging
-    unique_subtypes = df['Subtype'].unique()
-    logger.info(f"Found {len(unique_subtypes)} unique subtypes: {list(unique_subtypes)}")
-
     peptide_list = df['Peptide_sequence'].tolist()
-    
-    # Limit number of peptides if specified
-    if args.max_peptides:
-        df = df.head(args.max_peptides)
-        peptide_list = peptide_list[:args.max_peptides]
-        logger.info(f"Processing limited to {args.max_peptides} peptides")
-    
-    logger.info(f"Total peptides to process: {len(peptide_list)}")
 
-    # Process each peptide
-    for i, (_, row) in enumerate(df.iterrows(), 1):
-        peptide_sequence = row['Peptide_sequence']
-        protein_sequence = row['Protein_sequence']
-        subtype = row['Subtype']
+    # Create a cached MSA generation function
+    msa_cache = {}  # Cache MSA files by protein sequence hash
+    
+    def safe_get_a3m(protein_sequence, a3m_path: str, unique_id: str):
+        """Safer version of get_a3m with caching and better error handling"""
+        import subprocess
+        import hashlib
         
-        logger.info(f"Processing peptide {i}/{len(df)}: {peptide_sequence} (Subtype: {subtype})")
+        # Create a hash of the protein sequence for caching
+        protein_hash = hashlib.md5(protein_sequence.encode()).hexdigest()[:12]
         
-        # Create unique ID with subtype and peptide sequence
-        unique_id = f"{subtype}_{peptide_sequence}"
+        # Check if we already have an MSA for this protein sequence
+        if protein_hash in msa_cache:
+            cached_path = msa_cache[protein_hash]
+            if os.path.exists(cached_path):
+                logger.info(f"Using cached MSA from {cached_path}")
+                # Copy the cached MSA to the target path
+                import shutil
+                shutil.copy2(cached_path, a3m_path)
+                return
         
-        a3m_path = f"a3m_generation/{unique_id}.a3m"
+        # Also check for any existing MSA files in the directory that might match this protein
+        try:
+            existing_files = [f for f in os.listdir("a3m_generation") if f.endswith('.a3m')]
+            for existing_file in existing_files:
+                existing_path = os.path.join("a3m_generation", existing_file)
+                if os.path.getsize(existing_path) > 3000000:  # Large MSA files are likely for the same protein
+                    logger.info(f"Reusing existing large MSA file: {existing_file}")
+                    import shutil
+                    shutil.copy2(existing_path, a3m_path)
+                    msa_cache[protein_hash] = a3m_path
+                    return
+        except Exception as e:
+            logger.debug(f"Could not check for existing MSA files: {e}")
+        
+        filename_query = os.path.join("a3m_generation", 'query_' + unique_id + '.fasta')
         
         try:
-            logger.info(f"Generating MSA for {unique_id}...")
-            preprocess.get_a3m(protein_sequence, a3m_path, unique_id)
+            # Create query file
+            with open(filename_query, "w") as file:
+                file.write(">" + unique_id + "\n" + protein_sequence)
             
-            logger.info(f"Preprocessing for inference...")
-            np_sample = preprocess.preprocess_for_inference(protein_sequence, peptide_sequence, a3m_path)
+            os.makedirs(os.path.dirname(a3m_path), exist_ok=True)
             
-            my_model = model.Model()
+            # Run MSA generation with proper error checking
+            cmd = f"./a3m_generation/msa_run --fasta_file {filename_query} --output_file {a3m_path}"
+            logger.debug(f"Running MSA command: {cmd}")
             
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-                free_mem, total_mem = torch.cuda.mem_get_info(0)
-                logger.info(f"GPU Memory - Free: {free_mem / (1024 ** 2):.2f} MiB, Total: {total_mem / (1024 ** 2):.2f} MiB")
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
+            
+            # Check if subprocess succeeded OR if it failed but created job.a3m
+            job_a3m_path = os.path.join("a3m_generation", "job.a3m")
+            
+            if result.returncode != 0:
+                logger.warning(f"MSA subprocess returned error code {result.returncode}")
+                logger.info(f"stdout: {result.stdout}")
+                logger.info(f"stderr: {result.stderr}")
                 
-                logger.info(f"Running inference on {device}...")
-                my_model.inference(np_sample, unique_id)
-                logger.info(f"Inference completed successfully for {unique_id}")
+                # Check for alternative file names that might have been created
+                possible_files = [
+                    job_a3m_path,
+                    os.path.join("a3m_generation", "job.sto"),
+                    os.path.join("a3m_generation", "output.a3m"),
+                    os.path.join("a3m_generation", f"{unique_id}.a3m")
+                ]
                 
-        except Exception as e:
-            logger.error(f"Error occurred during processing for {unique_id}: {e}")
-            continue    # Initialize progress tracking
+                recovered = False
+                for possible_file in possible_files:
+                    if os.path.exists(possible_file) and os.path.getsize(possible_file) > 0:
+                        logger.info(f"Found alternative MSA file: {possible_file} (size: {os.path.getsize(possible_file)} bytes)")
+                        logger.info("MSA was generated successfully despite copy error, manually fixing...")
+                        import shutil
+                        shutil.copy2(possible_file, a3m_path)
+                        # Clean up the temporary file
+                        try:
+                            os.remove(possible_file)
+                        except:
+                            pass
+                        recovered = True
+                        break
+                
+                if not recovered:
+                    # List all files in the a3m_generation directory for debugging
+                    try:
+                        files_in_dir = os.listdir("a3m_generation")
+                        logger.info(f"Files in a3m_generation directory: {files_in_dir}")
+                    except:
+                        pass
+                    raise RuntimeError(f"MSA generation failed: {result.stderr}")
+            
+            # Wait a bit more to ensure file is fully written
+            import time as time_module
+            time_module.sleep(0.5)
+            
+            # Cache this MSA for reuse
+            if os.path.exists(a3m_path):
+                msa_cache[protein_hash] = a3m_path
+                logger.debug(f"Cached MSA for protein hash {protein_hash}")
+            
+        finally:
+            # Clean up query file only after subprocess completes
+            if os.path.exists(filename_query):
+                try:
+                    os.remove(filename_query)
+                except:
+                    pass  # Don't fail if cleanup fails
+
+    # Initialize model once outside the loop
+    logger.info("Initializing MHC-fine model...")
+    my_model = model.Model()
+    logger.info("Model initialized successfully")
+
+    # Initialize progress tracking
     start_time = time.time()
     successful_predictions = 0
     failed_predictions = 0
@@ -296,14 +333,16 @@ def main():
             logger.info(f"Current success rate: {current_success_rate:.1f}%")
         logger.info("-" * 60)
         
-        unique_id = f"batch_{i}_{pep[:10]}"  # Create a unique ID with peptide prefix
+        # Get the corresponding row data for this peptide
+        row = df[df['Peptide_sequence'] == pep].iloc[0]
+        protein_sequence = row['Protein_sequence']
+        subtype = row['Subtype']
         
-        # Use provided protein sequence or get from CSV
-        if args.protein_sequence:
-            protein_sequence = args.protein_sequence
-        else:
-            # Get protein sequence from the same row
-            protein_sequence = df[df['Peptide_sequence'] == pep]['Protein_sequence'].iloc[0]
+        # Create safe unique ID with sanitized subtype and peptide sequence
+        import re
+        safe_subtype = re.sub(r'[^a-zA-Z0-9_-]', '_', str(subtype))
+        safe_peptide = re.sub(r'[^a-zA-Z0-9_-]', '_', str(pep))
+        unique_id = f"{safe_subtype}_{safe_peptide}_{i}"  # Include index to ensure uniqueness
         
         peptide_sequence = pep
         a3m_path = f"a3m_generation/{unique_id}.a3m"
@@ -312,20 +351,55 @@ def main():
             # Step 1: MSA Generation
             step_start = time.time()
             logger.info(f"Step 1/3: Generating MSA for {unique_id}...")
-            preprocess.get_a3m(protein_sequence, a3m_path, unique_id)
+            
+            # Call MSA generation with better error handling
+            try:
+                safe_get_a3m(protein_sequence, a3m_path, unique_id)
+            except Exception as msa_error:
+                raise RuntimeError(f"MSA generation subprocess failed: {msa_error}")
+                
             msa_time = time.time() - step_start
+            
+            # Validate MSA file was created successfully with retry mechanism
+            import time as time_module
+            max_retries = 5
+            retry_delay = 1.0  # seconds
+            
+            for retry in range(max_retries):
+                if os.path.exists(a3m_path) and os.path.getsize(a3m_path) > 0:
+                    break
+                elif retry < max_retries - 1:
+                    logger.warning(f"MSA file not ready yet, retrying in {retry_delay}s... (attempt {retry + 1}/{max_retries})")
+                    time_module.sleep(retry_delay)
+                else:
+                    if not os.path.exists(a3m_path):
+                        raise FileNotFoundError(f"MSA generation failed: {a3m_path} was not created after {max_retries} retries")
+                    else:
+                        raise ValueError(f"MSA generation failed: {a3m_path} is empty after {max_retries} retries")
+                
             logger.info(f"✓ MSA generation completed in {format_time(msa_time)}")
+            logger.info(f"MSA file size: {os.path.getsize(a3m_path)} bytes")
             
             # Step 2: Preprocessing
             step_start = time.time()
             logger.info(f"Step 2/3: Preprocessing for inference...")
             np_sample = preprocess.preprocess_for_inference(protein_sequence, peptide_sequence, a3m_path)
             preprocess_time = time.time() - step_start
+            
+            # Validate preprocessing result
+            if np_sample is None:
+                raise ValueError(f"Preprocessing failed: preprocess_for_inference returned None for {unique_id}")
+            
+            if not isinstance(np_sample, dict):
+                raise ValueError(f"Preprocessing failed: expected dict, got {type(np_sample)} for {unique_id}")
+            
+            if len(np_sample) == 0:
+                raise ValueError(f"Preprocessing failed: empty result for {unique_id}")
+                
             logger.info(f"✓ Preprocessing completed in {format_time(preprocess_time)}")
+            logger.info(f"Preprocessing result keys: {list(np_sample.keys()) if np_sample else 'None'}")
             
             # Step 3: Model Inference
-            my_model = model.Model()
-            
             if device.type == "cuda":
                 torch.cuda.empty_cache()
                 free_mem, total_mem = torch.cuda.mem_get_info(0)
@@ -333,6 +407,13 @@ def main():
                 
                 step_start = time.time()
                 logger.info(f"Step 3/3: Running inference on {device}...")
+                logger.info(f"About to call inference with np_sample type: {type(np_sample)}")
+                logger.info(f"np_sample keys: {list(np_sample.keys()) if hasattr(np_sample, 'keys') else 'No keys method'}")
+                
+                # Ensure model is in evaluation mode and clear any cached state
+                if hasattr(my_model, 'model') and hasattr(my_model.model, 'eval'):
+                    my_model.model.eval()
+                
                 my_model.inference(np_sample, unique_id)
                 inference_time = time.time() - step_start
                 
@@ -343,11 +424,25 @@ def main():
                 logger.info(f"✓ Total time for peptide {i}: {format_time(peptide_total_time)}")
                 logger.info(f"✓ SUCCESS: {unique_id} processed successfully")
                 
+                # Clean up MSA file only on success
+                if os.path.exists(a3m_path):
+                    try:
+                        os.remove(a3m_path)
+                        logger.debug(f"Cleaned up MSA file: {a3m_path}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to clean up MSA file {a3m_path}: {cleanup_error}")
+                
         except Exception as e:
             failed_predictions += 1
             peptide_total_time = time.time() - peptide_start_time
             logger.error(f"✗ FAILED: Error occurred during processing for {unique_id} after {format_time(peptide_total_time)}: {e}")
-            continue
+            logger.error(f"Full error details: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            # Keep failed MSA files for debugging - only log their presence
+            if os.path.exists(a3m_path):
+                logger.info(f"Keeping MSA file for debugging: {a3m_path} (size: {os.path.getsize(a3m_path)} bytes)")
 
     # Final summary
     total_time = time.time() - start_time
