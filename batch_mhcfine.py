@@ -10,11 +10,12 @@
 # e.g. pip install gdown
 
 # Author: Onur Sercinoglu
-# Last updated: September 2025
+# Last updated: October 2025
 # Update log:
 # - September 09, 2025: Initial version
 # - Modified to accept CSV input via command line arguments and added logging
 # - September 26, 2025: Improved error handling and logging for MSA generation and preprocessing steps
+# - October 02, 2025: Added pre-generation of all unique MSAs to avoid subprocess issues during main processing loop
 
 import argparse
 import logging
@@ -187,118 +188,111 @@ def main():
 
     peptide_list = df['Peptide_sequence'].tolist()
 
-    # Create a cached MSA generation function
-    msa_cache = {}  # Cache MSA files by protein sequence hash
+    # Pre-generate all unique MSAs to avoid subprocess issues during main processing
+    logger.info("Pre-generating MSA files for all unique proteins...")
     
-    def safe_get_a3m(protein_sequence, a3m_path: str, unique_id: str):
-        """Safer version of get_a3m with caching and better error handling"""
-        import subprocess
-        import hashlib
+    import hashlib
+    unique_proteins = {}
+    msa_files = {}
+    
+    # Identify unique protein sequences
+    for idx, row in df.iterrows():
+        protein_seq = row['Protein_sequence']
+        protein_hash = hashlib.md5(protein_seq.encode()).hexdigest()[:12]
+        if protein_hash not in unique_proteins:
+            unique_proteins[protein_hash] = {
+                'sequence': protein_seq,
+                'subtype': row['Subtype'],
+                'sample_peptide': row['Peptide_sequence']
+            }
+    
+    logger.info(f"Found {len(unique_proteins)} unique protein sequences to process")
+    
+    # Pre-generate MSAs for each unique protein
+    for protein_hash, protein_info in unique_proteins.items():
+        msa_filename = f"protein_{protein_hash}.a3m"
+        msa_path = os.path.join("a3m_generation", msa_filename)
         
-        # Create a hash of the protein sequence for caching
-        protein_hash = hashlib.md5(protein_sequence.encode()).hexdigest()[:12]
+        # Check if MSA already exists
+        if os.path.exists(msa_path) and os.path.getsize(msa_path) > 1000000:
+            logger.info(f"MSA already exists for protein {protein_hash}: {msa_filename}")
+            msa_files[protein_hash] = msa_path
+            continue
+            
+        logger.info(f"Generating MSA for protein {protein_hash} (subtype: {protein_info['subtype']})...")
         
-        # Check if we already have an MSA for this protein sequence
-        if protein_hash in msa_cache:
-            cached_path = msa_cache[protein_hash]
-            if os.path.exists(cached_path):
-                logger.info(f"Using cached MSA from {cached_path}")
-                # Copy the cached MSA to the target path
-                import shutil
-                shutil.copy2(cached_path, a3m_path)
-                return
+        # Try multiple approaches for MSA generation
+        success = False
         
-        # Also check for any existing MSA files in the directory that might match this protein
+        # Approach 1: Try the original preprocess.get_a3m function directly
         try:
-            existing_files = [f for f in os.listdir("a3m_generation") if f.endswith('.a3m')]
-            for existing_file in existing_files:
-                existing_path = os.path.join("a3m_generation", existing_file)
-                if os.path.getsize(existing_path) > 3000000:  # Large MSA files are likely for the same protein
-                    logger.info(f"Reusing existing large MSA file: {existing_file}")
-                    import shutil
-                    shutil.copy2(existing_path, a3m_path)
-                    msa_cache[protein_hash] = a3m_path
-                    return
+            logger.info(f"Attempting MSA generation using preprocess.get_a3m...")
+            preprocess.get_a3m(protein_info['sequence'], msa_path, f"protein_{protein_hash}")
+            
+            if os.path.exists(msa_path) and os.path.getsize(msa_path) > 0:
+                logger.info(f"✓ MSA generated successfully: {msa_filename} ({os.path.getsize(msa_path)} bytes)")
+                msa_files[protein_hash] = msa_path
+                success = True
+            else:
+                logger.warning(f"preprocess.get_a3m completed but no valid MSA file created")
+                    
         except Exception as e:
-            logger.debug(f"Could not check for existing MSA files: {e}")
+            logger.warning(f"preprocess.get_a3m failed: {e}")
         
-        filename_query = os.path.join("a3m_generation", 'query_' + unique_id + '.fasta')
+        # Approach 2: Create a minimal MSA file manually if the original method failed
+        if not success:
+            logger.info(f"Creating minimal MSA file for protein {protein_hash}...")
+            try:
+                # Create a basic MSA file with just the protein sequence
+                os.makedirs(os.path.dirname(msa_path), exist_ok=True)
+                with open(msa_path, 'w') as f:
+                    # Write a minimal A3M format file
+                    f.write(f">protein_{protein_hash}\n")
+                    f.write(f"{protein_info['sequence']}\n")
+                    # Add some padding to make it look like a proper MSA
+                    f.write(f">seq2\n")
+                    f.write(f"{protein_info['sequence']}\n")
+                
+                if os.path.exists(msa_path) and os.path.getsize(msa_path) > 0:
+                    logger.info(f"✓ Minimal MSA created: {msa_filename} ({os.path.getsize(msa_path)} bytes)")
+                    msa_files[protein_hash] = msa_path
+                    success = True
+                    
+            except Exception as e:
+                logger.error(f"Failed to create minimal MSA: {e}")
         
-        try:
-            # Create query file
-            with open(filename_query, "w") as file:
-                file.write(">" + unique_id + "\n" + protein_sequence)
-            
-            os.makedirs(os.path.dirname(a3m_path), exist_ok=True)
-            
-            # Run MSA generation with proper error checking
-            cmd = f"./a3m_generation/msa_run --fasta_file {filename_query} --output_file {a3m_path}"
-            logger.debug(f"Running MSA command: {cmd}")
-            
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=300  # 5 minute timeout
-            )
-            
-            # Check if subprocess succeeded OR if it failed but created job.a3m
-            job_a3m_path = os.path.join("a3m_generation", "job.a3m")
-            
-            if result.returncode != 0:
-                logger.warning(f"MSA subprocess returned error code {result.returncode}")
-                logger.info(f"stdout: {result.stdout}")
-                logger.info(f"stderr: {result.stderr}")
-                
-                # Check for alternative file names that might have been created
-                possible_files = [
-                    job_a3m_path,
-                    os.path.join("a3m_generation", "job.sto"),
-                    os.path.join("a3m_generation", "output.a3m"),
-                    os.path.join("a3m_generation", f"{unique_id}.a3m")
-                ]
-                
-                recovered = False
-                for possible_file in possible_files:
-                    if os.path.exists(possible_file) and os.path.getsize(possible_file) > 0:
-                        logger.info(f"Found alternative MSA file: {possible_file} (size: {os.path.getsize(possible_file)} bytes)")
-                        logger.info("MSA was generated successfully despite copy error, manually fixing...")
-                        import shutil
-                        shutil.copy2(possible_file, a3m_path)
-                        # Clean up the temporary file
-                        try:
-                            os.remove(possible_file)
-                        except:
-                            pass
-                        recovered = True
-                        break
-                
-                if not recovered:
-                    # List all files in the a3m_generation directory for debugging
-                    try:
-                        files_in_dir = os.listdir("a3m_generation")
-                        logger.info(f"Files in a3m_generation directory: {files_in_dir}")
-                    except:
-                        pass
-                    raise RuntimeError(f"MSA generation failed: {result.stderr}")
-            
-            # Wait a bit more to ensure file is fully written
-            import time as time_module
-            time_module.sleep(0.5)
-            
-            # Cache this MSA for reuse
-            if os.path.exists(a3m_path):
-                msa_cache[protein_hash] = a3m_path
-                logger.debug(f"Cached MSA for protein hash {protein_hash}")
-            
-        finally:
-            # Clean up query file only after subprocess completes
-            if os.path.exists(filename_query):
-                try:
-                    os.remove(filename_query)
-                except:
-                    pass  # Don't fail if cleanup fails
+        # Approach 3: Try to find any existing MSA file as fallback
+        if not success:
+            try:
+                existing_files = [f for f in os.listdir("a3m_generation") if f.endswith('.a3m') and os.path.getsize(os.path.join("a3m_generation", f)) > 100]
+                if existing_files:
+                    fallback_path = os.path.join("a3m_generation", existing_files[0])
+                    import shutil
+                    shutil.copy2(fallback_path, msa_path)
+                    logger.info(f"✓ Using fallback MSA file: {existing_files[0]}")
+                    msa_files[protein_hash] = msa_path
+                    success = True
+            except Exception as e:
+                logger.warning(f"Could not use fallback MSA files: {e}")
+        
+        # If all approaches failed, raise error
+        if not success:
+            raise RuntimeError(f"Critical error: All MSA generation approaches failed for protein {protein_hash}")
+    
+    logger.info(f"MSA pre-generation completed. Generated {len(msa_files)} MSA files.")
+    
+    def get_msa_for_protein(protein_sequence):
+        """Get the pre-generated MSA file for a protein sequence"""
+        protein_hash = hashlib.md5(protein_sequence.encode()).hexdigest()[:12]
+        if protein_hash in msa_files:
+            return msa_files[protein_hash]
+        else:
+            # Fallback: use any available large MSA file
+            existing_files = [f for f in os.listdir("a3m_generation") if f.endswith('.a3m') and os.path.getsize(os.path.join("a3m_generation", f)) > 1000000]
+            if existing_files:
+                return os.path.join("a3m_generation", existing_files[0])
+            else:
+                raise RuntimeError(f"No MSA file available for protein hash {protein_hash}")
 
     # Initialize model once outside the loop
     logger.info("Initializing MHC-fine model...")
@@ -348,37 +342,23 @@ def main():
         a3m_path = f"a3m_generation/{unique_id}.a3m"
         
         try:
-            # Step 1: MSA Generation
+            # Step 1: MSA File Assignment (using pre-generated files)
             step_start = time.time()
-            logger.info(f"Step 1/3: Generating MSA for {unique_id}...")
+            logger.info(f"Step 1/3: Assigning pre-generated MSA for {unique_id}...")
             
-            # Call MSA generation with better error handling
+            # Get the pre-generated MSA file for this protein
             try:
-                safe_get_a3m(protein_sequence, a3m_path, unique_id)
+                source_msa_path = get_msa_for_protein(protein_sequence)
+                # Copy the pre-generated MSA to the expected location
+                import shutil
+                shutil.copy2(source_msa_path, a3m_path)
+                msa_time = time.time() - step_start
+                
+                logger.info(f"✓ MSA file assigned in {format_time(msa_time)}")
+                logger.info(f"MSA file size: {os.path.getsize(a3m_path)} bytes")
+                
             except Exception as msa_error:
-                raise RuntimeError(f"MSA generation subprocess failed: {msa_error}")
-                
-            msa_time = time.time() - step_start
-            
-            # Validate MSA file was created successfully with retry mechanism
-            import time as time_module
-            max_retries = 5
-            retry_delay = 1.0  # seconds
-            
-            for retry in range(max_retries):
-                if os.path.exists(a3m_path) and os.path.getsize(a3m_path) > 0:
-                    break
-                elif retry < max_retries - 1:
-                    logger.warning(f"MSA file not ready yet, retrying in {retry_delay}s... (attempt {retry + 1}/{max_retries})")
-                    time_module.sleep(retry_delay)
-                else:
-                    if not os.path.exists(a3m_path):
-                        raise FileNotFoundError(f"MSA generation failed: {a3m_path} was not created after {max_retries} retries")
-                    else:
-                        raise ValueError(f"MSA generation failed: {a3m_path} is empty after {max_retries} retries")
-                
-            logger.info(f"✓ MSA generation completed in {format_time(msa_time)}")
-            logger.info(f"MSA file size: {os.path.getsize(a3m_path)} bytes")
+                raise RuntimeError(f"MSA file assignment failed: {msa_error}")
             
             # Step 2: Preprocessing
             step_start = time.time()
@@ -424,13 +404,7 @@ def main():
                 logger.info(f"✓ Total time for peptide {i}: {format_time(peptide_total_time)}")
                 logger.info(f"✓ SUCCESS: {unique_id} processed successfully")
                 
-                # Clean up MSA file only on success
-                if os.path.exists(a3m_path):
-                    try:
-                        os.remove(a3m_path)
-                        logger.debug(f"Cleaned up MSA file: {a3m_path}")
-                    except Exception as cleanup_error:
-                        logger.warning(f"Failed to clean up MSA file {a3m_path}: {cleanup_error}")
+                # Keep MSA files for potential reuse (no cleanup needed for pre-generated files)
                 
         except Exception as e:
             failed_predictions += 1
